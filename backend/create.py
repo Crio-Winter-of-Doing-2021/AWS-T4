@@ -5,7 +5,7 @@ import pexpect
 import re
 import sys
 
-def runProcess(exe, LambdaName):    
+def runProcess(exe, option, LambdaName):    
     print("Started runProcess")
     try:
         child = pexpect.spawn(exe,cwd=LambdaName,timeout=300,logfile=sys.stdout,encoding='utf-8')
@@ -26,12 +26,20 @@ def runProcess(exe, LambdaName):
 
         error = "Serverless Error ----------------------------------------"
         success = 'endpoints:'
-        if(error in l):
-            return False,l[l.index(error)+1]
-        elif(success in l):
-            return True, l[l.index(success)+1].split()[2]
+        if(option=="d"):
+            # print("in deploy")
+            if(error in l):
+                return False,l[l.index(error)+1]
+            elif(success in l):
+                # print("in success", l[l.index(success)+1])
+                return True, l[l.index(success)+1].split()[2]
+            else:
+                return False, "Unknown Error"
         else:
-            return False, "Unknown Error"
+            # print("in package")
+            if(error in l):
+                return False,l[l.index(error)+1]
+            return True, ""
 
         
     except pexpect.TIMEOUT:
@@ -46,11 +54,14 @@ def runProcess(exe, LambdaName):
 
 def deploy(f, requirements, LambdaName, region="", access_key="", secret_access_key="", session_token=""):
 
+    print(LambdaName)
     stream = os.popen("mkdir {0} && cp -r sample_dir/. {0}/ ".format(LambdaName))
     output = stream.read()
     print(output)
 
+    print(f)
     obj=open("temp.py","w")
+    f = f.replace("\\n","\n").replace("\\t","\t")
     obj.write(f)
     obj.close()
     temp=__import__("temp")
@@ -94,12 +105,27 @@ def deploy(f, requirements, LambdaName, region="", access_key="", secret_access_
     obj.write("\n"+reqs)
     obj.close()
 
-    obj=open("/home/mehul/.aws/credentials","w")
-    obj.write("[default]\nregion={0}\naws_access_key_id={1}\naws_secret_access_key={2}\naws_session_token={3}".format(region,access_key,secret_access_key,session_token))
-    obj.close()
+    # obj=open("/home/mehul/.aws/credentials","w")
+    # obj.write("[default]\nregion={0}\naws_access_key_id={1}\naws_secret_access_key={2}\naws_session_token={3}".format(region,access_key,secret_access_key,session_token))
+    # obj.close()
 
-    
-    correct, res = runProcess("serverless deploy --aws-profile default",LambdaName)
+    os.environ['AWS_ACCESS_KEY_ID'] = access_key
+    os.environ['AWS_SECRET_ACCESS_KEY'] = secret_access_key
+    os.environ['AWS_SESSION_TOKEN'] = session_token    
+
+    correct, res = runProcess("serverless package --package my-package","p",LambdaName)
+    if(correct==False):
+        return res
+
+    stream = os.popen("chmod 777 -R {0}".format(LambdaName))
+    output = stream.read()
+    print(output)
+
+    # correct, res = runProcess("serverless deploy --aws-profile default",LambdaName)
+    correct, res = runProcess("serverless deploy --package my-package","d",LambdaName)
+    stream = os.popen("rm -rf {0}".format(LambdaName))
+    output = stream.read()
+    print(output)
     return correct, res
 
 # LambdaName = "my-app"

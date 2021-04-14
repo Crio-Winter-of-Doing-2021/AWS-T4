@@ -80,18 +80,35 @@ scheduler.start()
 # Function for adding task in DB
 
 
-def scheduleInDb(TaskURL, RunTime, LambdaName, LambdaDescription, Username, SchedulingType):
+def scheduleInDb(TaskURL, RunTime, LambdaName, LambdaDescription, Username, SchedulingType, Retries, TimeBetweenRetries):
 
     print("SCHEDULING IN DB: ", TaskURL, RunTime)
 
-    idQuery = "INSERT INTO " + tableName + " (url,run_time,lambda_name,lambda_description,status,execution_time,username,scheduling_type)" + " VALUES('{url}','{run_time}','{lambda_name}','{lambda_description}','Scheduled',0,'{username}','{scheduling_type}')".format(
-        url=TaskURL, run_time=RunTime, lambda_name=LambdaName, lambda_description=LambdaDescription, username=Username, scheduling_type=SchedulingType) + " RETURNING id;"
+    id = None
+    while(True):
+        id = random.randint(1, 1e17)
+        retrieveQuery = "SELECT * FROM " + tableName + \
+        " WHERE id = '{0}'".format(id)
+        cur.execute(retrieveQuery)
+        fetchedTasks = cur.fetchall()
+        if(len(fetchedTasks)==0):
+            break
+
+    idQuery = "INSERT INTO " + tableName + " (id,url,run_time,lambda_name,lambda_description,status,execution_time,username,scheduling_type,retries,time_between_retries)" + " VALUES('{id}','{url}','{run_time}','{lambda_name}','{lambda_description}','Scheduled',0,'{username}','{scheduling_type}','{retries}','{time_between_retries}')".format(id=id, url=TaskURL, run_time=RunTime, lambda_name=LambdaName, lambda_description=LambdaDescription, username=Username, scheduling_type=SchedulingType, retries=Retries, time_between_retries=TimeBetweenRetries)
     cur.execute(idQuery)
-    Taskid = cur.fetchone()[0]
+    Taskid = id
     conn.commit()
 
     print("Task scheduled with id : ", Taskid)
     return Taskid
+
+
+def updateInDb(Taskid, TaskURL, RunTime, status):
+    statusQuery = "UPDATE " + tableName + \
+        " SET status = '{3}', url='{1}', run_time='{2}' WHERE id = {0}".format(
+            Taskid, TaskURL, RunTime, status)
+    cur.execute(statusQuery)
+    conn.commit()
 
 
 """
@@ -225,17 +242,25 @@ def lambdaCaller(TaskURL, Taskid, retries, timeBetweenRetries):
     # time.sleep(50)
 
     startTime = datetime.now()
-    send = requests.get(TaskURL)
 
+    f = 0
     try:
-        res = eval(send.content)
+        send = requests.get(TaskURL)
     except Exception as e:
+        f = 1
         print(e)
-        res = send.content
-    print(send.status_code, res)
-    if(send.status_code != 200 or isinstance(res, dict) and 'errorMessage' in res):
+
+    if(f == 0):
+        try:
+            res = eval(send.content)
+        except Exception as e:
+            print(e)
+            res = send.content
+        print(send.status_code, res)
+
+    if(f == 1 or send.status_code != 200 or isinstance(res, dict) and 'errorMessage' in res):
         print("Task failed")
-        setStatusInDB(Taskid, "Failed")
+
         if retries is not None and retries > 0:
             print("RETRYING TASKID: ", Taskid, " RETRY LEFT: ", retries)
             now = datetime.now(utc)
@@ -249,6 +274,8 @@ def lambdaCaller(TaskURL, Taskid, retries, timeBetweenRetries):
                 max_instances=1,
                 run_date=now + timeBetweenRetries
             )
+        else:
+            setStatusInDB(Taskid, "Failed")
 
     else:
         endTime = datetime.now()
@@ -259,9 +286,70 @@ def lambdaCaller(TaskURL, Taskid, retries, timeBetweenRetries):
         print("Completed lambda: ", Taskid, TaskURL)
         setStatusInDB(Taskid, "Completed")
 
+
+def functionDeploy(id, choosenOption, timeInMS, datetimeStr, retries, timeBetweenRetries, funcSrc, requirements, LambdaName, region, access_key, secret_access_key, session_token, args):
+    success, res = create.deploy(
+        funcSrc, requirements, LambdaName, region, access_key, secret_access_key, session_token)
+
+    if(success == False):
+        setStatusInDB(id, "DeploymentFailed")
+        return Response(res, status=400, mimetype="application/json")
+
+    print("Deployed successfully: " + res)
+    if(len(args) > 0):
+        for a in args:
+            res += "/"+a
+    TaskURL = res
+
+    print("RETRIES: ", retries)
+    print(timeBetweenRetries)
+
+    if choosenOption == '1':
+
+        now = datetime.now(utc)
+        updateInDb(id, TaskURL, now +
+                   timedelta(milliseconds=timeInMS), "Scheduled")
+
+        scheduler.add_job(
+            lambdaCaller,
+            trigger='date',
+            jobstore='default',
+            args=[TaskURL, str(id), int(retries),
+                  timedelta(milliseconds=timeBetweenRetries)],
+            id=str(id),
+            max_instances=1,
+            run_date=now + timedelta(milliseconds=timeInMS)
+        )
+
+    elif choosenOption == '2':
+
+        print("Local time: ", datetimeStr)
+
+        # Assuming the input will always from a Indian Timezone
+        # Converting to utc
+        local = pytz.timezone('Asia/Kolkata')
+        # Expecting format from frontend: "13 Mar 2021 07:08:38"
+        datetimeStr = datetime.strptime(datetimeStr, "%d %b %Y %H:%M:%S")
+        local_time = local.localize(datetimeStr, is_dst=None)
+        utc_time = local_time.astimezone(pytz.utc)
+
+        print("UTC Time: ", utc_time)
+
+        updateInDb(id, TaskURL, utc_time, "Scheduled")
+
+        scheduler.add_job(
+            lambdaCaller,
+            trigger='date',
+            jobstore='default',
+            args=[TaskURL, str(id), int(retries),
+                  timedelta(milliseconds=timeBetweenRetries)],
+            id=str(id),
+            max_instances=1,
+            run_date=utc_time
+        )
+
+
 # Function to schedule tasks
-
-
 @app.route('/tasks', methods=["POST"])
 def schedule():
 
@@ -286,6 +374,8 @@ def schedule():
     TaskURL = None
     retries = None
     timeBetweenRetries = None
+    timeInMS = None
+    datetimeStr = None
 
     if("retries" in json):
         correct, res = check(json, ['timeBetweenRetries'])
@@ -307,10 +397,29 @@ def schedule():
         retries = 0
         timeBetweenRetries = 0
 
-    LambdaName = str(json['LambdaName']) if "LambdaName" in json else ''.join(
+    LambdaName = str(json['LambdaName']) if "LambdaName" in json and len(json["LambdaName"]) > 0 else ''.join(
         random.choices(string.ascii_uppercase + string.digits, k=7))
     LambdaDescription = str(
         json['LambdaDescription']) if "LambdaDescription" in json else ''
+
+    if choosenOption == '1':
+        correct, res = check(json, ['timeInMS'])
+
+        if(correct == False):
+            return res
+
+        timeInMS = int(json['timeInMS'])
+
+    elif choosenOption == '2':
+        correct, res = check(json, ['dateTimeValue'])
+
+        if(correct == False):
+            return res
+
+        datetimeStr = json['dateTimeValue']
+
+    else:
+        return Response("Please provide correct schedulingOption", status=400, mimetype="application/json")
 
     if(taskType.lower() == "function"):
         correct, res = check(json, ['funcSrc', 'requirements', 'region',
@@ -327,17 +436,27 @@ def schedule():
         session_token = json["session_token"]
         args = json["args"]
 
-        success, res = create.deploy(
-            funcSrc, requirements, LambdaName, region, access_key, secret_access_key, session_token)
+        now = datetime.now(utc)
 
-        if(success == False):
-            return Response(res, status=400, mimetype="application/json")
+        id = scheduleInDb(
+            "", now, LambdaName, LambdaDescription, username, taskType, retries, timeBetweenRetries)
+        setStatusInDB(id, "Deploying")
+        addFunctionDataInDB(id, funcSrc, requirements)
 
-        print("Deployed successfully: " + res)
-        if(len(args) > 0):
-            for a in args:
-                res += "/"+a
-        TaskURL = res
+        now = datetime.now(utc)
+
+        scheduler.add_job(
+            functionDeploy,
+            trigger='date',
+            jobstore='default',
+            args=[str(id), choosenOption, timeInMS, datetimeStr, retries, timeBetweenRetries, funcSrc,
+                  requirements, LambdaName, region, access_key, secret_access_key, session_token, args],
+            id=str(id),
+            max_instances=1,
+            run_date=now + timedelta(milliseconds=1000)
+        )
+
+        return jsonify({"id": id})
 
     elif(taskType.lower() == "url"):
         correct, res = check(json, ['TaskURL'])
@@ -354,18 +473,13 @@ def schedule():
     print(timeBetweenRetries)
 
     if choosenOption == '1':
-        correct, res = check(json, ['timeInMS'])
 
-        if(correct == False):
-            return res
-
-        timeInMS = int(json['timeInMS'])
         now = datetime.now(utc)
         id = scheduleInDb(
-            TaskURL, now + timedelta(milliseconds=timeInMS), LambdaName, LambdaDescription, username, taskType)
+            TaskURL, now + timedelta(milliseconds=timeInMS), LambdaName, LambdaDescription, username, taskType, retries, timeBetweenRetries)
 
-        if(taskType.lower() == "function"):
-            addFunctionDataInDB(id, funcSrc, requirements)
+        # if(taskType.lower() == "function"):
+        #     addFunctionDataInDB(id, funcSrc, requirements)
 
         print("GENERATED ID: ", id)
 
@@ -383,12 +497,7 @@ def schedule():
         return jsonify({"id": id})
 
     elif choosenOption == '2':
-        correct, res = check(json, ['dateTimeValue'])
 
-        if(correct == False):
-            return res
-
-        datetimeStr = json['dateTimeValue']
         print("Local time: ", datetimeStr)
         # Assuming the input will always from a Indian Timezone
         # Converting to utc
@@ -401,10 +510,10 @@ def schedule():
         print("UTC Time: ", utc_time)
 
         id = scheduleInDb(
-            TaskURL, utc_time, LambdaName, LambdaDescription, username, taskType)
+            TaskURL, utc_time, LambdaName, LambdaDescription, username, taskType, retries, timeBetweenRetries)
 
-        if(taskType.lower() == "function"):
-            addFunctionDataInDB(id, funcSrc, requirements)
+        # if(taskType.lower() == "function"):
+        #     addFunctionDataInDB(id, funcSrc, requirements)
 
         scheduler.add_job(
             lambdaCaller,
@@ -455,7 +564,7 @@ def cancel(Taskid):
         scheduler.remove_job(Taskid)
         setStatusInDB(Taskid, "Cancelled")
         print("Cancelled task with id:{0}".format(Taskid))
-        return Response("Cancelled "+str(Taskid), status=200, mimetype="application/json")
+        return Response("Cancelled TaskID: "+str(Taskid), status=200, mimetype="application/json")
     except Exception as err:
         print("ERROR: ", err)
         print("TaskID ", Taskid, " doesn't exist")
@@ -466,22 +575,53 @@ def cancel(Taskid):
 @ app.route('/tasks/<Taskid>', methods=["GET"])
 def checkStatus(Taskid):
 
+    print("TASKID:", Taskid)
+
+    if(Taskid == -1):
+        return Response("Taskid is required", status=400, mimetype="application/json")
+
     auth, res = check_auth(request.headers)
     if(auth == False):
         return res
 
     username = request.headers["username"]
 
-    retrieveQuery = "SELECT status FROM " + tableName + \
+    retrieveQuery = "SELECT * FROM " + tableName + \
         " WHERE id = {idValue} AND username = '{usernameValue}'".format(
             idValue=Taskid, usernameValue=username)
     cur.execute(retrieveQuery)
-    fetchedvalues = cur.fetchone()
-    # # Iterate and append all task objects with id, url, delay which have status=status to tasks list
-    if(fetchedvalues is not None):
-        return jsonify(fetchedvalues[0])
+    try:
+        task = list(cur.fetchall()[0])
+    except:
+        print("Failed to fetch task")
+        return Response("Not allowed to access TaskSetID "+str(Taskid), status=403, mimetype="application/json")
 
-    return Response("Not allowed to access TaskSetID "+str(Taskid), status=403, mimetype="application/json")
+    print("FETCHED TASK: ", task)
+    # print(type(task))
+    # # Iterate and append all task objects with id, url, delay which have status=status to tasks list
+    if(task is not None):
+        data = {
+            "Taskid": task[5],
+            "TaskURL": task[0],
+            "Runtime": task[1],
+            "Status": task[2],
+            "TimeToExecute": round(task[6]),
+            "ScheduleType": task[8],
+            "LambdaName": task[3],
+            "LambdaDescription": task[4],
+            "Retries": task[9],
+            "TimeBetweenRetries": task[10]
+        }
+        if(task[8] == "function"):
+            retrieveQuery = "SELECT * FROM " + functionTableName + \
+                " WHERE id = '{id}'".format(id=task[5])
+            cur.execute(retrieveQuery)
+            fetchedTasks = cur.fetchall()
+            data["funcSrc"] = fetchedTasks[0][1]
+            data["requirements"] = fetchedTasks[0][2]
+        return jsonify(data)
+
+    return Response("Not allowed to access TaskID "+str(Taskid), status=403, mimetype="application/json")
 
 
 # Function to modify scheduler task
@@ -518,11 +658,11 @@ def modify():
         cur.execute(taskQuery)
         fetchedTask = cur.fetchall()
         if(len(fetchedTask) == 0):
-            raise Exception("Invalid Id to cancel")
+            raise Exception("Invalid Id to modify")
     except:
         # Taskid doesn't exist
         print("Invalid Taskid")
-        return Response("Not allowed to access TaskSetID "+str(Taskid), status=403, mimetype="application/json")
+        return Response("Not allowed to access TaskID "+str(Taskid), status=403, mimetype="application/json")
 
     # Trying to reshedule the job
     try:
@@ -558,13 +698,13 @@ def retrieveAll():
         " WHERE username = '{usernameValue}'".format(usernameValue=username)
     cur.execute(retrieveQuery)
     fetchedTasks = cur.fetchall()
-    print("FETCHED\n", fetchedTasks[0])
+    print("FETCHED\n")
     # # Iterate and append all task objects with id, url, delay which have status=status to tasks list
 
     tasks = []
 
     for task in fetchedTasks:
-        tasks.append({
+        data = {
             "Taskid": task[5],
             "TaskURL": task[0],
             "Runtime": task[1],
@@ -572,8 +712,18 @@ def retrieveAll():
             "TimeToExecute": round(task[6]),
             "ScheduleType": task[8],
             "LambdaName": task[3],
-            "LambdaDescription": task[4]
-        })
+            "LambdaDescription": task[4],
+            "Retries": task[9],
+            "TimeBetweenRetries": task[10]
+        }
+        if(task[8] == "function"):
+            retrieveQuery = "SELECT * FROM " + functionTableName + \
+                " WHERE id = '{id}'".format(id=task[5])
+            cur.execute(retrieveQuery)
+            fetchedTasks = cur.fetchall()
+            data["funcSrc"] = fetchedTasks[0][1]
+            data["requirements"] = fetchedTasks[0][2]
+        tasks.append(data)
 
     return jsonify(tasks)
 
@@ -586,7 +736,7 @@ def retrieveWithStatus(status):
     if(auth == False):
         return res
 
-    if(status not in ["Completed", "Cancelled", "Failed", "Running"]):
+    if(status not in ["Completed", "Cancelled", "Failed", "Running", "Scheduled", "Deploying", "DeploymentFailed"]):
         return Response("Invalid Status: "+status, status=404, mimetype="application/json")
 
     username = request.headers["username"]
@@ -601,15 +751,25 @@ def retrieveWithStatus(status):
     tasks = []
 
     for task in fetchedTasks:
-        tasks.append({
+        data = {
             "Taskid": task[5],
             "TaskURL": task[0],
             "Runtime": task[1],
             "TimeToExecute": round(task[6]),
             "ScheduleType": task[8],
             "LambdaName": task[3],
-            "LambdaDescription": task[4]
-        })
+            "LambdaDescription": task[4],
+            "Retries": task[9],
+            "TimeBetweenRetries": task[10]
+        }
+        if(task[8] == "function"):
+            retrieveQuery = "SELECT * FROM " + functionTableName + \
+                " WHERE id = '{id}'".format(id=task[5])
+            cur.execute(retrieveQuery)
+            fetchedTasks = cur.fetchall()
+            data["funcSrc"] = fetchedTasks[0][1]
+            data["requirements"] = fetchedTasks[0][2]
+        tasks.append(data)
 
     return jsonify(tasks)
 
@@ -758,6 +918,8 @@ def orchestratorCaller(taskset_id, num, total, type, url, conditionCheckUrl="", 
 @app.route('/taskset', methods=["POST"])
 def orchestrate():
 
+    print("REQUEST: ", request.json)
+
     auth, res = check_auth(request.headers)
     if(auth == False):
         return res
@@ -771,7 +933,7 @@ def orchestrate():
     if(correct == False):
         return res
 
-    initialDelay = json["initialDelay"]
+    initialDelay = int(json["initialDelay"])
     tasks = json["tasks"]
 
     if(len(tasks) < 2):
@@ -784,6 +946,8 @@ def orchestrate():
     cur.execute(idQuery)
     id = cur.fetchone()[0]
     conn.commit()
+
+    print("ID ASSIGNED: ", id)
 
     num = 0
     for task in tasks:
@@ -817,6 +981,8 @@ def orchestrate():
         max_instances=1,
         run_date=now + timedelta(milliseconds=initialDelay)
     )
+
+    print("ORCHESTRATION ADDED")
 
     return jsonify({"id": id})
 
@@ -886,7 +1052,7 @@ def modify_taskset():
             job_id=Taskid,
             jobstore='default',
             trigger='date',
-            run_date=now + timedelta(milliseconds=initialDelay)
+            run_date=now + timedelta(milliseconds=int(initialDelay))
         )
 
     except Exception as err:
